@@ -151,7 +151,7 @@ class App(tk.Tk):
             if self.normalize.get():
                 mx = np.max(np.abs(ir))
                 if mx > 0:
-                    ir = ir / mx * 0.99
+                    ir = ir / mx * 0.5
 
             stem, _ = os.path.splitext(os.path.basename(path))
             out_path = os.path.join(outdir, stem + "_IR.wav")

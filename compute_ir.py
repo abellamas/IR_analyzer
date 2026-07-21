@@ -128,7 +128,7 @@ def main():
         if not args.no_normalize:
             mx = np.max(np.abs(ir))
             if mx > 0:
-                ir = ir / mx * 0.99
+                ir = ir / mx * 0.5
 
         rel = os.path.relpath(path, args.input_dir)
         stem, _ = os.path.splitext(rel)
