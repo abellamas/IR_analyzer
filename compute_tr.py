@@ -25,12 +25,45 @@ import argparse
 import numpy as np
 import soundfile as sf
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import hilbert
 
 from filterbank import FilterBank
 
 
+DBFS_REF = 1.0
+
+
 def to_mono(x):
     return x if x.ndim == 1 else x.mean(axis=1)
+
+
+def _band_envelope(h, sr, ventana_suavizado_ms=20.0):
+    """Compute the analytic envelope of a bandpassed IR and smooth it."""
+    analytic = hilbert(h)
+    envelope = np.abs(analytic)
+    window = max(3, int(round(ventana_suavizado_ms / 1000.0 * sr)))
+    return uniform_filter1d(envelope, size=window, mode="nearest")
+
+
+def _band_plot_data(h, sr, smooth_lengths=(501, 2000)):
+    """Return time and dBFS curves for a bandpass signal's envelope."""
+    analytic = hilbert(h.astype(np.float64))
+    envelope = np.abs(analytic)
+    if envelope.size == 0:
+        return {"t": np.array([]), "raw_db": np.array([]), "smooth_db": [], "labels": []}
+
+    t = np.arange(envelope.size) / sr
+    raw_db = 20 * np.log10(np.maximum(envelope / DBFS_REF, 1e-12))
+
+    smooth_db = []
+    labels = []
+    for M in smooth_lengths:
+        window = max(3, int(round(M)))
+        smoothed = uniform_filter1d(envelope, size=window, mode="nearest")
+        smooth_db.append(20 * np.log10(np.maximum(smoothed / DBFS_REF, 1e-12)))
+        labels.append(f"E(t) M={M}")
+
+    return {"t": t, "raw_db": raw_db, "smooth_db": smooth_db, "labels": labels}
 
 
 def _lundeby(e, sr, max_iter=15, min_rango_db=10.0, margen_db=10.0, ventana_suavizado_ms=20.0):
@@ -74,15 +107,15 @@ def _lundeby(e, sr, max_iter=15, min_rango_db=10.0, margen_db=10.0, ventana_suav
     window = max(3, int(round(ventana_suavizado_ms / 1000.0 * sr)))
     e_smooth = uniform_filter1d(e[:ultimo_activo + 1], size=window, mode="nearest")
 
-    db = 10 * np.log10(np.maximum(e_smooth, 1e-300) / pico)
+    db = 10 * np.log10(np.maximum(e_smooth, 1e-300))
     t = np.arange(len(e_smooth)) / sr
     pico_idx = int(np.argmax(db))
 
     n_tail = max(1, len(e_smooth) // 10)
     noise = float(np.mean(e_smooth[-n_tail:]))
-    if noise <= 0 or 10 * np.log10(pico / noise) < min_rango_db:
+    if noise <= 0 or db[pico_idx] - 10 * np.log10(np.maximum(noise, 1e-300)) < min_rango_db:
         return None, None
-    noise_db = 10 * np.log10(noise / pico)
+    noise_db = 10 * np.log10(np.maximum(noise, 1e-300))
 
     t_cross = t[-1]
     t_cross_libre = None  # crosspoint SIN recortar al buffer, para juzgar si el recorte es razonable
@@ -109,11 +142,11 @@ def _lundeby(e, sr, max_iter=15, min_rango_db=10.0, margen_db=10.0, ventana_suav
         convergio = abs(nuevo_t_cross - t_cross) < 0.002
         t_cross, t_cross_libre = nuevo_t_cross, nuevo_t_cross_libre
 
-        i_desde = min(int(np.searchsorted(t, t_cross + 0.05)), len(e_smooth) - 10)
-        if i_desde < len(e_smooth) - 10:
-            nuevo_noise = float(np.mean(e_smooth[i_desde:]))
+        i_desde = min(int(np.searchsorted(t, t_cross + 0.05)), len(e) - 10)
+        if i_desde < len(e) - 10:
+            nuevo_noise = float(np.mean(e[i_desde:]))
             if nuevo_noise > 0:
-                noise, noise_db = nuevo_noise, 10 * np.log10(nuevo_noise / pico)
+                noise, noise_db = nuevo_noise, 10 * np.log10(np.maximum(nuevo_noise, 1e-300))
 
         if convergio:
             break
@@ -128,14 +161,39 @@ def _lundeby(e, sr, max_iter=15, min_rango_db=10.0, margen_db=10.0, ventana_suav
     if t_cross_libre is None or t_cross_libre > t[-1] + margen_tolerable:
         return None, None
 
-    return noise, int(round(t_cross * sr))
+    n_cross = int(round(t_cross * sr))
+    if n_cross >= len(e):
+        n_cross = len(e) - 1
+
+    tail_offset = int(round(0.05 * sr))
+    tail_start = min(n_cross + tail_offset, len(e))
+    if tail_start < len(e):
+        final_noise = float(np.mean(e[tail_start:]))
+        if final_noise > 0:
+            noise = final_noise
+
+    return noise, n_cross
 
 
-def schroeder_decay_db(h, sr, ventana_suavizado_ms=20.0):
+def schroeder_decay_db(h, sr, ventana_suavizado_ms=20.0, noise_correction=True):
     """Curva de decaimiento en dB: integral de Schroeder truncada en el
     crosspoint de Lundeby, compensada por el piso de ruido estimado ahi mismo.
+
+    Usa la envolvente de Hilbert sobre la respuesta banda para seguir el
+    flujo de envelope-based RT recomendado en MATLAB/ISO, y luego integra
+    la energia de la envolvente cruda al estilo Schroeder.
+
+    En Matlab equivalente:
+        hA = abs(hilbert(h));
+        E = cumsum(hA(td:-1:1).^2);
+        L = 10*log10(E / E(1));
+
+    Aquí agregamos corrección de ruido opcional:
+        E_corr(t) = E(t) - (Tc - t) * N
     """
-    e_full = h.astype(np.float64) ** 2
+    analytic = hilbert(h.astype(np.float64))
+    hA = np.abs(analytic)
+    e_full = hA ** 2
     noise_power, n_cross = _lundeby(e_full, sr, ventana_suavizado_ms=ventana_suavizado_ms)
     if noise_power is None:
         return None, None, float("nan"), float("nan")
@@ -143,8 +201,11 @@ def schroeder_decay_db(h, sr, ventana_suavizado_ms=20.0):
     e = e_full[:n_cross]
 
     e_raw = np.cumsum(e[::-1])[::-1]
-    muestras_restantes = n_cross - np.arange(n_cross)
-    e_corr = e_raw - muestras_restantes * noise_power
+    if noise_correction:
+        muestras_restantes = n_cross - np.arange(n_cross)
+        e_corr = e_raw - muestras_restantes * noise_power
+    else:
+        e_corr = e_raw
 
     if e_corr[0] <= 0:
         return None, None, noise_power, n_cross / sr
@@ -155,28 +216,31 @@ def schroeder_decay_db(h, sr, ventana_suavizado_ms=20.0):
 
     e_corr = e_corr[:ultimo]
     t = np.arange(ultimo) / sr
-    l_db = 10 * np.log10(e_corr / e_corr[0])
-    return t, l_db, noise_power, n_cross / sr
+    l_db_abs = 10 * np.log10(np.maximum(e_corr / (DBFS_REF ** 2), 1e-300))
+    l_db_rel = l_db_abs - l_db_abs[0]
+    return t, l_db_rel, l_db_abs, noise_power, n_cross / sr
 
 
-def _regresion_t60(t, l_db, db_hi, db_lo):
-    """Ajusta una recta a l_db en [db_lo, db_hi] (ambos <= 0, db_hi > db_lo) y devuelve el T60 equivalente."""
+def _regresion_t60_line(t, l_db, db_hi, db_lo):
+    """Ajusta una recta a l_db en [db_lo, db_hi] y devuelve el T60, tiempos y valores de la recta."""
     mask = (l_db <= db_hi) & (l_db >= db_lo)
     if mask.sum() < 2:
-        return float("nan")
-    pendiente, _ = np.polyfit(t[mask], l_db[mask], 1)
+        return float("nan"), np.array([]), np.array([])
+    pendiente, intercept = np.polyfit(t[mask], l_db[mask], 1)
     if pendiente >= 0:
-        return float("nan")
-    return -60.0 / pendiente
+        return float("nan"), np.array([]), np.array([])
+    t_line = t[mask]
+    y_line = pendiente * t_line + intercept
+    return -60.0 / pendiente, t_line, y_line
 
 
 def edt_t20_t30(t, l_db):
     if t is None:
-        return float("nan"), float("nan"), float("nan")
-    edt = _regresion_t60(t, l_db, 0, -10)
-    t20 = _regresion_t60(t, l_db, -5, -25)
-    t30 = _regresion_t60(t, l_db, -5, -35)
-    return edt, t20, t30
+        return float("nan"), float("nan"), float("nan"), np.array([]), np.array([]), np.array([]), np.array([])
+    edt, _, _ = _regresion_t60_line(t, l_db, 0, -10)
+    t20, t20_t, t20_y = _regresion_t60_line(t, l_db, -5, -25)
+    t30, t30_t, t30_y = _regresion_t60_line(t, l_db, -5, -35)
+    return edt, t20, t30, t20_t, t20_y, t30_t, t30_y
 
 
 def _recortar_padding_final(ir, margen_ratio=1e-9):
@@ -200,7 +264,7 @@ def _recortar_padding_final(ir, margen_ratio=1e-9):
     return ir[:activos[-1] + 1]
 
 
-def calcular_tr(ir, sr, bands="1/1", fmin=100, fmax=5000):
+def calcular_tr(ir, sr, bands="1/1", fmin=100, fmax=5000, noise_correction=True):
     ir = _recortar_padding_final(ir)
     fb = FilterBank(sr=sr, bands=bands, fmin=fmin, fmax=fmax)
     ir_bands = fb.filter_bands(ir)
@@ -208,10 +272,33 @@ def calcular_tr(ir, sr, bands="1/1", fmin=100, fmax=5000):
     resultados = {}
     for f_nom in fb.center_freqs_nominal:
         h, sr_band = ir_bands[f_nom]
-        t, l_db, noise_power, t_cross = schroeder_decay_db(h, sr_band)
-        edt, t20, t30 = edt_t20_t30(t, l_db)
+        t, l_db_rel, l_db_abs, noise_power, t_cross = schroeder_decay_db(
+            h, sr_band, noise_correction=noise_correction)
+        edt, t20, t30, t20_t, t20_y_rel, t30_t, t30_y_rel = edt_t20_t30(t, l_db_rel)
+        curve = _band_plot_data(h, sr_band)
         noise_db = 10 * np.log10(noise_power) if (noise_power == noise_power and noise_power > 0) else float("nan")
-        resultados[f_nom] = {"EDT": edt, "T20": t20, "T30": t30, "Noise_dB": noise_db, "t_cross_s": t_cross}
+        t20_y_abs = t20_y_rel + (l_db_abs[0] if t20_y_rel.size > 0 else 0.0)
+        t30_y_abs = t30_y_rel + (l_db_abs[0] if t30_y_rel.size > 0 else 0.0)
+        resultados[f_nom] = {
+            "EDT": edt,
+            "T20": t20,
+            "T30": t30,
+            "Noise_dB": noise_db,
+            "t_cross_s": t_cross,
+            "curve": curve,
+            "schroeder": {
+                "t": t,
+                "l_db_rel": l_db_rel,
+                "l_db_abs": l_db_abs,
+                "noise_power": noise_power,
+                "noise_db": noise_db,
+                "t_cross_s": t_cross,
+                "t20_fit_t": t20_t,
+                "t20_fit_y": t20_y_abs,
+                "t30_fit_t": t30_t,
+                "t30_fit_y": t30_y_abs,
+            },
+        }
     return resultados
 
 

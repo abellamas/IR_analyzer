@@ -9,6 +9,9 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
 
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 import numpy as np
 import soundfile as sf
 
@@ -26,6 +29,7 @@ class App(tk.Tk):
 
         self._ultimo_tr = None
         self._ultimo_tr_bands = None
+        self._ultimo_tr_band_selected = tk.StringVar()
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
@@ -50,9 +54,10 @@ class App(tk.Tk):
         self.audio_paths = []
         self.outdir = tk.StringVar()
         self.ir_seconds = tk.StringVar(value="5.0")
-        self.preroll_ms = tk.StringVar(value="5.0")
+        self.ir_mode = tk.StringVar(value="filter")
+        self.ir_end_mode = tk.StringVar(value="kurtosis")
         self.normalize = tk.BooleanVar(value=True)
-        self.subtype = tk.StringVar(value="FLOAT")
+        self.subtype = tk.StringVar(value="PCM_24")
 
         pad = {"padx": 8, "pady": 4}
 
@@ -74,13 +79,25 @@ class App(tk.Tk):
 
         f4 = ttk.Frame(root)
         f4.pack(fill="x", **pad)
-        ttk.Label(f4, text="Duracion IR (s, 0=completa):").pack(side="left")
+        ttk.Label(f4, text="Duracion IR (s):").pack(side="left")
         ttk.Entry(f4, textvariable=self.ir_seconds, width=6).pack(side="left", padx=4)
-        ttk.Label(f4, text="Preroll (ms):").pack(side="left", padx=(12, 0))
-        ttk.Entry(f4, textvariable=self.preroll_ms, width=6).pack(side="left", padx=4)
-        ttk.Checkbutton(f4, text="Normalizar", variable=self.normalize).pack(side="left", padx=(12, 0))
-        ttk.Label(f4, text="Formato:").pack(side="left", padx=(12, 0))
-        ttk.Combobox(f4, textvariable=self.subtype, values=["FLOAT", "PCM_24", "PCM_16"],
+        ttk.Label(f4, text="(solo si Fin = Manual)").pack(side="left", padx=(12, 0))
+
+        f5 = ttk.Frame(root)
+        f5.pack(fill="x", **pad)
+        ttk.Label(f5, text="Fin de la IR:").pack(side="left")
+        ttk.Radiobutton(f5, text="Auto por kurtosis", variable=self.ir_end_mode, value="kurtosis").pack(side="left", padx=4)
+        ttk.Radiobutton(f5, text="Manual", variable=self.ir_end_mode, value="fixed").pack(side="left", padx=4)
+        ttk.Radiobutton(f5, text="Completa", variable=self.ir_end_mode, value="full").pack(side="left", padx=4)
+
+        f6 = ttk.Frame(root)
+        f6.pack(fill="x", **pad)
+        ttk.Label(f6, text="Inicio de la IR:").pack(side="left")
+        ttk.Radiobutton(f6, text="Completa (N+M-1)", variable=self.ir_mode, value="full").pack(side="left", padx=4)
+        ttk.Radiobutton(f6, text="Desde final del filtro", variable=self.ir_mode, value="filter").pack(side="left", padx=4)
+        ttk.Checkbutton(f6, text="Normalizar", variable=self.normalize).pack(side="left", padx=(12, 0))
+        ttk.Label(f6, text="Formato:").pack(side="left", padx=(12, 0))
+        ttk.Combobox(f6, textvariable=self.subtype, values=["PCM_24", "FLOAT", "PCM_16"],
                      width=8, state="readonly").pack(side="left")
 
         self.run_btn = ttk.Button(root, text="Procesar", command=self.run)
@@ -120,19 +137,23 @@ class App(tk.Tk):
             return
         try:
             ir_seconds = float(self.ir_seconds.get())
-            preroll_ms = float(self.preroll_ms.get())
         except ValueError:
-            self.print_log("Duracion IR / preroll invalidos.")
+            self.print_log("Duracion IR invalidos.")
+            return
+
+        if self.ir_end_mode.get() == "fixed" and ir_seconds <= 0:
+            self.print_log("Duracion IR manual debe ser mayor que 0.")
             return
 
         self.run_btn.config(state="disabled")
         self.log.delete("1.0", "end")
-        threading.Thread(target=self.process, args=(ir_seconds, preroll_ms), daemon=True).start()
+        threading.Thread(target=self.process, args=(ir_seconds,), daemon=True).start()
 
-    def process(self, ir_seconds, preroll_ms):
+    def process(self, ir_seconds):
         outdir = self.outdir.get() or os.path.join(os.path.dirname(self.audio_paths[0]), "IR")
         os.makedirs(outdir, exist_ok=True)
-        ir_seconds = None if ir_seconds == 0 else ir_seconds
+        if self.ir_end_mode.get() != "fixed":
+            ir_seconds = None
 
         f, sr = sf.read(self.filtro_path.get(), always_2d=False)
         f = to_mono(f)
@@ -146,18 +167,26 @@ class App(tk.Tk):
                 continue
             rec = to_mono(rec)
             full = dec(rec)
-            ir, peak = extract_ir(full, sr, preroll_ms, ir_seconds)
+            ir, start, peak = extract_ir(
+                full,
+                sr,
+                0,
+                ir_seconds,
+                start_mode=self.ir_mode.get(),
+                end_mode=self.ir_end_mode.get(),
+                inv_filter_len=dec.lf if self.ir_mode.get() == "filter" else None,
+            )
 
             if self.normalize.get():
                 mx = np.max(np.abs(ir))
                 if mx > 0:
-                    ir = ir / mx * 0.99
+                    ir = ir / mx * 0.5
 
             stem, _ = os.path.splitext(os.path.basename(path))
             out_path = os.path.join(outdir, stem + "_IR.wav")
             sf.write(out_path, ir.astype("float32"), sr, subtype=self.subtype.get())
             self.after(0, self.print_log,
-                       f"  [{i}/{len(self.audio_paths)}] {stem}  ->  pico@{peak/sr:.3f}s  IR={len(ir)/sr:.2f}s")
+                       f"  [{i}/{len(self.audio_paths)}] {stem}  ->  inicio@{start/sr:.3f}s  pico@{peak/sr:.3f}s  IR={len(ir)/sr:.2f}s")
 
         self.after(0, self.print_log, "\nListo. Salida en: " + outdir)
         self.after(0, lambda: self.run_btn.config(state="normal"))
@@ -236,9 +265,10 @@ class App(tk.Tk):
 
     def _build_tab_tr(self, root):
         self.tr_ir_path = tk.StringVar()
-        self.tr_bands = tk.StringVar(value="1/1")
+        self.tr_bands = tk.StringVar(value="1/3")
         self.tr_fmin = tk.StringVar(value="100")
-        self.tr_fmax = tk.StringVar(value="5000")
+        self.tr_fmax = tk.StringVar(value="12000")
+        self.tr_noise_correction = tk.BooleanVar(value=True)
 
         pad = {"padx": 8, "pady": 4}
 
@@ -257,12 +287,26 @@ class App(tk.Tk):
         ttk.Entry(f2, textvariable=self.tr_fmin, width=6).pack(side="left", padx=4)
         ttk.Label(f2, text="fmax (Hz):").pack(side="left", padx=(12, 0))
         ttk.Entry(f2, textvariable=self.tr_fmax, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(f2, text="Corrección de ruido", variable=self.tr_noise_correction).pack(side="left", padx=(12, 0))
 
         self.tr_run_btn = ttk.Button(root, text="Calcular TR", command=self.run_tr)
         self.tr_run_btn.pack(pady=8)
 
-        self.tr_log = tk.Text(root, height=18)
-        self.tr_log.pack(fill="both", expand=True, **pad)
+        f3 = ttk.Frame(root)
+        f3.pack(fill="x", **pad)
+        ttk.Label(f3, text="Ver banda:").pack(side="left")
+        self.tr_band_select = ttk.Combobox(f3, textvariable=self._ultimo_tr_band_selected,
+                                           values=[], width=10, state="readonly")
+        self.tr_band_select.pack(side="left", padx=4)
+        self.tr_band_select.bind("<<ComboboxSelected>>", lambda e: self.update_tr_plot())
+
+        self.tr_log = tk.Text(root, height=10)
+        self.tr_log.pack(fill="x", **pad)
+
+        self.tr_fig = plt.Figure(figsize=(6, 3), dpi=100)
+        self.tr_ax = self.tr_fig.add_subplot(111)
+        self.tr_canvas = FigureCanvasTkAgg(self.tr_fig, master=root)
+        self.tr_canvas.get_tk_widget().pack(fill="both", expand=True, **pad)
 
     def tr_print(self, msg):
         self.tr_log.insert("end", msg + "\n")
@@ -285,7 +329,12 @@ class App(tk.Tk):
     def process_tr(self, fmin, fmax):
         try:
             ir, sr = sf.read(self.tr_ir_path.get(), always_2d=False)
-            resultados = calcular_tr(to_mono(ir), sr, bands=self.tr_bands.get(), fmin=fmin, fmax=fmax)
+            resultados = calcular_tr(
+                to_mono(ir), sr,
+                bands=self.tr_bands.get(),
+                fmin=fmin, fmax=fmax,
+                noise_correction=self.tr_noise_correction.get(),
+            )
         except Exception as e:
             self.after(0, self.tr_print, f"Error: {e}")
             self.after(0, lambda: self.tr_run_btn.config(state="normal"))
@@ -293,7 +342,13 @@ class App(tk.Tk):
 
         self._ultimo_tr = resultados
         self._ultimo_tr_bands = self.tr_bands.get()
+        band_keys = [str(f_nom) for f_nom in sorted(resultados)]
+        self.after(0, lambda: self.tr_band_select.configure(values=band_keys))
+        self.after(0, lambda: self._ultimo_tr_band_selected.set(band_keys[0] if band_keys else ""))
 
+        self.after(0, self.update_tr_plot)
+        self.after(0, self.tr_print,
+                   f"Corrección de ruido: {'ON' if self.tr_noise_correction.get() else 'OFF'}")
         self.after(0, self.tr_print,
                    f"{'Banda (Hz)':>10}  {'EDT (s)':>8}  {'T20 (s)':>8}  {'T30 (s)':>8}  {'Ruido':>8}  {'Cross (s)':>9}")
         for f_nom in sorted(resultados):
@@ -302,6 +357,63 @@ class App(tk.Tk):
                        f"{f_nom:>10}  {r['EDT']:>8.2f}  {r['T20']:>8.2f}  {r['T30']:>8.2f}  "
                        f"{r['Noise_dB']:>6.1f}dB  {r['t_cross_s']:>9.2f}")
         self.after(0, lambda: self.tr_run_btn.config(state="normal"))
+
+    def update_tr_plot(self):
+        selected = self._ultimo_tr_band_selected.get()
+        if not self._ultimo_tr or not selected:
+            return
+        try:
+            band = float(selected)
+        except ValueError:
+            return
+        if band not in self._ultimo_tr:
+            return
+        result = self._ultimo_tr[band]
+        curve = result.get("curve", {})
+        sch = result.get("schroeder", {})
+
+        t = sch.get("t", np.array([]))
+        l_db_abs = sch.get("l_db_abs", np.array([]))
+        noise_db = sch.get("noise_db", float("nan"))
+        t_cross = sch.get("t_cross_s", float("nan"))
+        t20_t = sch.get("t20_fit_t", np.array([]))
+        t20_y = sch.get("t20_fit_y", np.array([]))
+
+        plot_t = curve.get("t", np.array([]))
+        raw_db = curve.get("raw_db", np.array([]))
+        smooth_db = curve.get("smooth_db", [])
+        labels = curve.get("labels", [])
+
+        self.tr_ax.clear()
+        if plot_t.size > 0:
+            self.tr_ax.plot(plot_t, raw_db, color="blue", linewidth=0.8, label="E(t) envelope (dBFS)")
+            for y, label in zip(smooth_db, labels):
+                self.tr_ax.plot(plot_t, y, linewidth=1.5, label=label)
+
+        if t.size > 0:
+            self.tr_ax.plot(t, l_db_abs, color="black", linewidth=2, label="Schroeder L(t) (dBFS)")
+        if t20_t.size > 0:
+            self.tr_ax.plot(t20_t, t20_y, color="orange", linestyle="--", linewidth=2, label="T20 fit")
+        if np.isfinite(t_cross) and t.size > 0:
+            y_cross = np.interp(t_cross, t, l_db_abs)
+            self.tr_ax.axvline(t_cross, color="red", linestyle=":", linewidth=1.5, label="t_cross (ruido)")
+            self.tr_ax.scatter([t_cross], [y_cross], color="red", s=40)
+            self.tr_ax.text(t_cross, y_cross - 5, f"t_c={t_cross:.3f}s", color="red",
+                            ha="center", va="top", fontsize=8, bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"})
+
+        if np.isfinite(noise_db) and t.size > 0:
+            self.tr_ax.axhline(noise_db, color="magenta", linestyle="-.", linewidth=1.5, label="Noise floor (dBFS)")
+            self.tr_ax.text(0.02 * max(t[-1], 1.0), noise_db + 2,
+                            f"Noise={noise_db:.1f} dBFS", color="magenta",
+                            ha="left", va="bottom", fontsize=8, bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"})
+
+        self.tr_ax.set_xlabel("Time [s]")
+        self.tr_ax.set_ylabel("Level [dB]")
+        self.tr_ax.set_title(f"Banda {selected} Hz")
+        self.tr_ax.set_ylim(-120, 5)
+        self.tr_ax.grid(True, linestyle="--", alpha=0.4)
+        self.tr_ax.legend(loc="upper right", fontsize=7)
+        self.tr_canvas.draw()
 
     # ---------------- Tab: Validación ----------------
 

@@ -27,6 +27,7 @@ import sys
 import numpy as np
 import soundfile as sf
 from scipy.fft import rfft, irfft, next_fast_len
+from scipy.ndimage import uniform_filter1d
 
 
 def to_mono(x):
@@ -58,15 +59,117 @@ class Deconvolver:
         return y
 
 
-def extract_ir(full, sr, preroll_ms, ir_seconds):
-    peak = int(np.argmax(np.abs(full)))
-    pre = int(round(preroll_ms * 1e-3 * sr))
-    start = max(0, peak - pre)
-    if ir_seconds is None:
-        end = len(full)
+def _windowed_kurtosis(x, window, step):
+    starts = np.arange(0, max(1, len(x) - window + 1), step, dtype=int)
+    kur = np.full(len(starts), np.nan, dtype=np.float64)
+    for i, s in enumerate(starts):
+        w = x[s:s + window].astype(np.float64)
+        m = np.mean(w)
+        v = np.mean((w - m) ** 2)
+        if v <= 0:
+            continue
+        kur[i] = np.mean((w - m) ** 4) / (v * v) - 3.0
+    return starts, kur
+
+
+def _detect_noise_start_by_kurtosis(full, sr, search_start, window_ms=80.0, step_ms=20.0):
+    h = full[search_start:]
+    if len(h) == 0:
+        return None
+
+    # Use short-term energy for kurtosis, which is more stable on decaying IR tails.
+    h = h.astype(np.float64) ** 2
+    window = max(1, int(round(window_ms * 1e-3 * sr)))
+    step = max(1, int(round(step_ms * 1e-3 * sr)))
+    starts, kur = _windowed_kurtosis(h, window, step)
+    if len(kur) == 0:
+        return None
+
+    kur = np.nan_to_num(kur, nan=0.0)
+    kur = uniform_filter1d(kur, size=5, mode="nearest")
+    peak = np.nanmax(kur)
+    if not np.isfinite(peak) or peak <= 0:
+        return None
+
+    threshold = max(1.0, peak * 0.20)
+    sustained = 5
+    for i in range(len(kur) - sustained + 1):
+        if np.all(kur[i:i + sustained] <= threshold):
+            return search_start + int(starts[i])
+    return None
+
+
+def _detect_ir_end_by_noise(full, sr, start, peak=None, window_ms=20.0, tail_fraction=0.1, margin_db=10.0):
+    h = full[start:]
+    if len(h) == 0:
+        return len(full)
+
+    e = h.astype(np.float64) ** 2
+    window = max(3, int(round(window_ms * 1e-3 * sr)))
+    e_smooth = uniform_filter1d(e, size=window, mode="nearest")
+
+    pico = float(np.max(e_smooth))
+    if pico <= 0:
+        return len(full)
+
+    n = len(e_smooth)
+    tail_len = max(int(round(0.5 * sr)), int(round(n * tail_fraction)))
+    tail_start = max(0, n - tail_len)
+    tail_segment = e_smooth[tail_start:]
+    if len(tail_segment) == 0:
+        return len(full)
+
+    noise = float(np.percentile(tail_segment, 20.0))
+    if noise <= 0:
+        return len(full)
+
+    threshold = noise * (10.0 ** (margin_db / 10.0))
+    below = e_smooth <= threshold
+    sustained = max(window, int(round(0.05 * sr)))
+    if peak is not None and peak >= start:
+        search_offset = peak - start
     else:
-        end = min(len(full), start + int(round(ir_seconds * sr)))
-    return full[start:end], peak
+        search_offset = 0
+
+    for i in range(search_offset, n - sustained + 1):
+        if np.all(below[i:i + sustained]):
+            return min(start + i, len(full))
+
+    return len(full)
+
+
+def _detect_ir_end_by_kurtosis(full, sr, start, peak, noise_margin_s=3.0):
+    search_start = max(start, peak)
+    noise_start = _detect_noise_start_by_kurtosis(full, sr, search_start)
+    if noise_start is None:
+        return len(full)
+    end = noise_start + int(round(noise_margin_s * sr))
+    return min(len(full), end)
+
+
+def extract_ir(full, sr, preroll_ms, ir_seconds, start_mode="filter", end_mode="fixed", inv_filter_len=None):
+    peak = int(np.argmax(np.abs(full)))
+    if start_mode == "full":
+        start = 0
+    elif start_mode == "filter":
+        start = min(max(0, int(inv_filter_len or 0)), len(full))
+    else:
+        start = max(0, peak - int(round(preroll_ms * 1e-3 * sr)))
+
+    if end_mode == "full":
+        end = len(full)
+    elif end_mode == "kurtosis":
+        end = _detect_ir_end_by_kurtosis(full, sr, start, peak)
+    else:
+        if ir_seconds is None:
+            end = len(full)
+        else:
+            if start_mode == "filter":
+                end = min(len(full), peak + int(round(ir_seconds * sr)))
+            else:
+                end = min(len(full), start + int(round(ir_seconds * sr)))
+
+    return full[start:end], start, peak
 
 
 def find_wavs(input_dir, filter_path, outdir):
@@ -91,9 +194,13 @@ def main():
     ap.add_argument("-o", "--outdir", default=None,
                     help="Directorio de salida (default: <input_dir>/IR)")
     ap.add_argument("--ir-seconds", type=float, default=5.0,
-                    help="Largo de la IR a guardar en segundos desde el onset (default 5; 0 = completa)")
+                    help="Largo de la IR a guardar en segundos cuando --end-mode fixed (default 5; 0 = completa)")
+    ap.add_argument("--end-mode", choices=["fixed", "kurtosis", "full"], default="fixed",
+                    help="Cómo recortar el final de la IR: fijo por segundos, auto por kurtosis, o completa")
     ap.add_argument("--preroll-ms", type=float, default=5.0,
-                    help="Milisegundos a conservar antes del pico (default 5)")
+                    help="Milisegundos a conservar antes del pico cuando no se usa filter-length-onset (default 5). Si se usa filter-length-onset, la IR empieza exactamente al final del filtro.")
+    ap.add_argument("--filter-length-onset", action="store_true",
+                    help="Iniciar la IR a partir del final del filtro inverso en lugar del pico.")
     ap.add_argument("--no-normalize", action="store_true",
                     help="No normalizar; conserva la escala cruda de la deconvolucion")
     ap.add_argument("--subtype", default="FLOAT", choices=["FLOAT", "PCM_24", "PCM_16"],
@@ -106,7 +213,10 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     dec = Deconvolver(f)
-    ir_seconds = None if args.ir_seconds == 0 else args.ir_seconds
+    if args.end_mode == "fixed":
+        ir_seconds = None if args.ir_seconds == 0 else args.ir_seconds
+    else:
+        ir_seconds = None
 
     files = list(find_wavs(args.input_dir, args.filtro, outdir))
     if not files:
@@ -123,19 +233,27 @@ def main():
             continue
         rec = to_mono(rec)
         full = dec(rec)
-        ir, peak = extract_ir(full, sr, args.preroll_ms, ir_seconds)
+        ir, start, peak = extract_ir(
+            full,
+            sr,
+            args.preroll_ms,
+            ir_seconds,
+            start_mode="filter" if args.filter_length_onset else "peak",
+            end_mode=args.end_mode,
+            inv_filter_len=dec.lf if args.filter_length_onset else None,
+        )
 
         if not args.no_normalize:
             mx = np.max(np.abs(ir))
             if mx > 0:
-                ir = ir / mx * 0.99
+                ir = ir / mx * 0.5
 
         rel = os.path.relpath(path, args.input_dir)
         stem, _ = os.path.splitext(rel)
         out_path = os.path.join(outdir, stem + "_IR.wav")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         sf.write(out_path, ir.astype(np.float32), sr, subtype=args.subtype)
-        print(f"  [{i:>3}/{len(files)}] {rel}  ->  pico@{peak/sr:.3f}s  IR={len(ir)/sr:.2f}s")
+        print(f"  [{i:>3}/{len(files)}] {rel}  ->  inicio@{start/sr:.3f}s  pico@{peak/sr:.3f}s  IR={len(ir)/sr:.2f}s")
 
     print("\nListo.")
     return 0
